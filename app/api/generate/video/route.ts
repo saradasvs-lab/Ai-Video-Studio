@@ -1,11 +1,10 @@
-import { put } from '@vercel/blob'
 import { NextResponse } from 'next/server'
 import { sql, type Generation } from '@/lib/db'
 import { ASPECT_RATIOS, findVideoModel } from '@/lib/models'
 import { getVisitorId } from '@/lib/visitor'
 import { hfPredict, fetchBytes, normaliseGradioFile } from '@/lib/hf'
+import { saveFile, makePathname } from '@/lib/storage'
 
-// Vercel function timeout – videos take longer than images
 export const maxDuration = 800
 
 type Body = {
@@ -20,8 +19,6 @@ type Body = {
 
 const SEQUENCE_PATTERN = /^[0-9a-f-]{36}$/i
 
-// ── Aspect-ratio helpers ───────────────────────────────────────────────────────
-
 function aspectToWH(ratio: string): { width: number; height: number } {
   const map: Record<string, { width: number; height: number }> = {
     '16:9': { width: 1280, height: 720 },
@@ -33,9 +30,6 @@ function aspectToWH(ratio: string): { width: number; height: number } {
   return map[ratio] ?? { width: 1280, height: 720 }
 }
 
-// ── MiniMax H3 Turbo (hf.space: observantdistressed/minimax-h3-turbo) ─────────
-// /predict(prompt, resolution, duration)
-// Returns: [{url: ...}] – the video file
 async function generateMinimaxVideo(opts: {
   prompt: string
   spaceUrl: string
@@ -44,35 +38,27 @@ async function generateMinimaxVideo(opts: {
   duration: number
   token?: string
 }): Promise<{ bytes: Buffer; contentType: string }> {
-  // The Space accepts: prompt, resolution (e.g. "1280x720"), duration (seconds)
   const { width, height } = aspectToWH(opts.aspectRatio)
   const resolution = `${width}x${height}`
-
   const result = await hfPredict({
     spaceUrl: opts.spaceUrl,
     apiName: opts.apiName,
     inputs: [opts.prompt, resolution, opts.duration],
     token: opts.token,
-    timeoutMs: 600_000, // 10 min for video
+    timeoutMs: 600_000,
   })
-
   const fileVal = Array.isArray(result.data) ? result.data[0] : result.data
   const { url, isDataUri } = normaliseGradioFile(fileVal)
-
   if (isDataUri) {
     const [header, b64] = url.split(',')
     const contentType = header.replace('data:', '').replace(';base64', '')
     return { bytes: Buffer.from(b64, 'base64'), contentType }
   }
-
   const absUrl = url.startsWith('http') ? url : `${opts.spaceUrl}${url}`
   const bytes = await fetchBytes(absUrl, opts.token)
   return { bytes, contentType: 'video/mp4' }
 }
 
-// ── LTX Video 2.5 (hf.space: iis007/ltx-2-5-video-studio) ───────────────────
-// /generate_video(prompt, negative_prompt, width, height, duration_seconds, seed, guidance_scale, num_inference_steps)
-// Returns: [{url: ...}]
 async function generateLTX(opts: {
   prompt: string
   spaceUrl: string
@@ -82,41 +68,25 @@ async function generateLTX(opts: {
   token?: string
 }): Promise<{ bytes: Buffer; contentType: string }> {
   const { width, height } = aspectToWH(opts.aspectRatio)
-  // LTX wants frames, not seconds – 25fps is typical
   const frames = opts.duration * 25
-
   const result = await hfPredict({
     spaceUrl: opts.spaceUrl,
     apiName: opts.apiName,
-    inputs: [
-      opts.prompt,                    // prompt
-      'worst quality, inconsistent', // negative_prompt
-      width,                          // width
-      height,                         // height
-      frames,                         // num_frames
-      0,                              // seed (0 = random)
-      3.0,                            // guidance_scale
-      30,                             // num_inference_steps
-    ],
+    inputs: [opts.prompt, 'worst quality, inconsistent', width, height, frames, 0, 3.0, 30],
     token: opts.token,
     timeoutMs: 600_000,
   })
-
   const fileVal = Array.isArray(result.data) ? result.data[0] : result.data
   const { url, isDataUri } = normaliseGradioFile(fileVal)
-
   if (isDataUri) {
     const [header, b64] = url.split(',')
     const contentType = header.replace('data:', '').replace(';base64', '')
     return { bytes: Buffer.from(b64, 'base64'), contentType }
   }
-
   const absUrl = url.startsWith('http') ? url : `${opts.spaceUrl}${url}`
   const bytes = await fetchBytes(absUrl, opts.token)
   return { bytes, contentType: 'video/mp4' }
 }
-
-// ── Generic dispatcher ─────────────────────────────────────────────────────────
 
 async function generateViaHF(opts: {
   model: ReturnType<typeof findVideoModel> & object
@@ -128,15 +98,12 @@ async function generateViaHF(opts: {
   const { model, prompt, aspectRatio, duration, token } = opts
   const spaceUrl = (model as { hfSpace: string }).hfSpace
   const apiName = (model as { hfApiName: string }).hfApiName
-
   if (model.id === 'minimax/minimax-h3') {
     return generateMinimaxVideo({ prompt, spaceUrl, apiName, aspectRatio, duration, token })
   }
   if (model.id === 'ltx/ltx-2-5') {
     return generateLTX({ prompt, spaceUrl, apiName, aspectRatio, duration, token })
   }
-
-  // Fallback: try generic /predict with [prompt, duration]
   const result = await hfPredict({ spaceUrl, apiName, inputs: [prompt, duration], token, timeoutMs: 600_000 })
   const fileVal = Array.isArray(result.data) ? result.data[0] : result.data
   const { url, isDataUri } = normaliseGradioFile(fileVal)
@@ -149,8 +116,6 @@ async function generateViaHF(opts: {
   const bytes = await fetchBytes(absUrl, token)
   return { bytes, contentType: 'video/mp4' }
 }
-
-// ── Route handler ──────────────────────────────────────────────────────────────
 
 export async function POST(request: Request) {
   const visitorId = await getVisitorId()
@@ -169,13 +134,10 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Unknown model.' }, { status: 400 })
   }
 
-  // Check whether this model has a free HF backend
   const hfSpace = (model as { hfSpace?: string }).hfSpace
   if (!hfSpace) {
     return NextResponse.json(
-      {
-        error: `${model.name} requires an API key. Choose a free model (Hailuo H3 or LTX Video 2.5) to generate videos for free.`,
-      },
+      { error: `${model.name} requires an API key. Choose a free model to generate videos for free.` },
       { status: 402 },
     )
   }
@@ -198,15 +160,12 @@ export async function POST(request: Request) {
       token,
     })
 
-    const blob = await put(
-      `ai-video-studio/${visitorId}/video-${crypto.randomUUID()}.mp4`,
-      bytes,
-      { access: 'private', contentType },
-    )
+    const pathname = makePathname(visitorId, 'video', 'mp4')
+    await saveFile(pathname, bytes)
 
     const rows = (await sql`
       INSERT INTO generations (visitor_id, kind, model, prompt, pathname, content_type, aspect_ratio, duration, sequence_id)
-      VALUES (${visitorId}, 'video', ${model.id}, ${prompt}, ${blob.pathname}, ${contentType}, ${aspectRatio}, ${duration}, ${sequenceId})
+      VALUES (${visitorId}, 'video', ${model.id}, ${prompt}, ${pathname}, ${contentType}, ${aspectRatio}, ${duration}, ${sequenceId})
       RETURNING id, kind, model, prompt, content_type, aspect_ratio, duration, sequence_id, created_at
     `) as Generation[]
 
@@ -214,10 +173,7 @@ export async function POST(request: Request) {
   } catch (error) {
     console.error('Video generation failed:', error)
     return NextResponse.json(
-      {
-        error:
-          'Video generation failed. The HF Space may be starting up – try again in 60 seconds, or choose a different model.',
-      },
+      { error: 'Video generation failed. The HF Space may be starting up – try again in 60 seconds.' },
       { status: 500 },
     )
   }

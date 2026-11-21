@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server'
-import { del } from '@vercel/blob'
 import { sql, type Generation } from '@/lib/db'
 import { getVisitorId } from '@/lib/visitor'
+import { deleteFile } from '@/lib/storage'
 
 export async function GET(request: NextRequest) {
   const visitorId = await getVisitorId()
@@ -35,7 +35,7 @@ export async function DELETE(request: NextRequest) {
   `) as { pathname: string }[]
 
   if (rows[0]) {
-    await del(rows[0].pathname).catch((error) => console.error('Blob delete failed:', error))
+    await deleteFile(rows[0].pathname).catch((error) => console.error('File delete failed:', error))
   }
   return NextResponse.json({ success: true })
 }
